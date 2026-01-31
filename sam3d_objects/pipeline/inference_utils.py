@@ -562,7 +562,7 @@ def pose_decoder(
         return {
             "translation": pose_instance_dict["instance_position_l2c"].squeeze(0),
             "rotation": pose_instance_dict["instance_quaternion_l2c"].squeeze(0),
-            "scale": pose_instance_dict["instance_scale_l2c"].squeeze(0).mean(-1, keepdim=True).expand(1,3),
+            "scale": pose_instance_dict["instance_scale_l2c"].squeeze(0), # .mean(-1, keepdim=True).expand(1,3),
         }
 
     return decode

@@ -88,11 +88,29 @@ class Inference:
         self._pipeline: InferencePipelinePointMap = instantiate(config)
 
     def merge_mask_to_rgba(self, image, mask):
+        if not isinstance(image, np.ndarray):
+            image = np.array(image)
         mask = mask.astype(np.uint8) * 255
         mask = mask[..., None]
         # embed mask in alpha channel
         rgba_image = np.concatenate([image[..., :3], mask], axis=-1)
         return rgba_image
+
+    def _ensure_rgba(self, image):
+        if isinstance(image, Image.Image):
+            if image.mode != "RGBA":
+                raise ValueError("mask is None but image is not RGBA")
+            return np.array(image)
+        if isinstance(image, np.ndarray):
+            if image.ndim != 3 or image.shape[-1] != 4:
+                raise ValueError("mask is None but image is not RGBA")
+            return image
+        return image
+
+    def _as_list(self, value):
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        return [value]
 
     def __call__(
         self,
@@ -100,20 +118,53 @@ class Inference:
         mask: Optional[Union[None, Image.Image, np.ndarray]],
         seed: Optional[int] = None,
         pointmap=None,
+        stage1_inference_steps: Optional[int] = None,
+        stage2_inference_steps: Optional[int] = None,
     ) -> dict:
-        image = self.merge_mask_to_rgba(image, mask)
-        return self._pipeline.run(
-            image,
-            None,
-            seed,
+        is_multi = isinstance(image, (list, tuple))
+        images = self._as_list(image)
+        if mask is None:
+            masks = [None] * len(images)
+        else:
+            masks = self._as_list(mask)
+            if len(masks) not in (1, len(images)):
+                raise ValueError("mask count must be 1 or match image count")
+            if len(masks) == 1 and len(images) > 1:
+                masks = masks * len(images)
+
+        rgba_images = [
+            self.merge_mask_to_rgba(img, m) if m is not None else self._ensure_rgba(img)
+            for img, m in zip(images, masks)
+        ]
+
+        pointmaps = None
+        if pointmap is not None:
+            pointmaps = self._as_list(pointmap)
+            if len(pointmaps) not in (1, len(rgba_images)):
+                raise ValueError("pointmap count must be 1 or match image count")
+            if len(pointmaps) == 1 and len(rgba_images) > 1:
+                pointmaps = pointmaps * len(rgba_images)
+
+        output = self._pipeline.run(
+            rgba_images,
+            seed=seed,
             stage1_only=False,
             with_mesh_postprocess=False,
             with_texture_baking=False,
             with_layout_postprocess=False,
             use_vertex_color=True,
-            stage1_inference_steps=None,
-            pointmap=pointmap,
+            stage1_inference_steps=stage1_inference_steps,
+            stage2_inference_steps=stage2_inference_steps,
+            pointmaps=pointmaps,
         )
+
+        if not is_multi:
+            if isinstance(output.get("pointmap"), list) and len(output["pointmap"]) == 1:
+                output["pointmap"] = output["pointmap"][0]
+            if isinstance(output.get("pointmap_colors"), list) and len(output["pointmap_colors"]) == 1:
+                output["pointmap_colors"] = output["pointmap_colors"][0]
+
+        return output
 
 
 def _yaw_pitch_r_fov_to_extrinsics_intrinsics(yaws, pitchs, rs, fovs):

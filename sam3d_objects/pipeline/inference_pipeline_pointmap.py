@@ -23,6 +23,19 @@ from sam3d_objects.pipeline.utils.pointmap import infer_intrinsics_from_pointmap
 from sam3d_objects.pipeline.inference_utils import o3d_plane_estimation, estimate_plane_area, layout_post_optimization, layout_post_optimization_method_GS
 
 
+def batchify(list_of_dicts):
+    keys = {k for d in list_of_dicts for k in d.keys()}
+    assert all(
+        all(k in d for k in keys) for d in list_of_dicts
+    ), "All dictionaries must have the same keys"
+    # Check that everything has a 1 batch dimension already.
+    assert all(
+        d[k].shape[0] == 1 for d in list_of_dicts for k in keys
+    ), "All tensors must have a batch dimension of 1"
+    batched_dict = {k: torch.cat([d[k] for d in list_of_dicts], dim=0) for k in keys}
+    return batched_dict
+
+
 def camera_to_pytorch3d_camera(device="cpu") -> DecomposedTransform:
     """
     R3 camera space --> PyTorch3D camera space
@@ -73,6 +86,7 @@ recursive_clone = recursive_fn_factory(torch.clone)
 def compile_wrapper(
     fn, *, mode="max-autotune", fullgraph=True, dynamic=False, name=None
 ):
+    return fn
     compiled_fn = torch.compile(fn, mode=mode, fullgraph=fullgraph, dynamic=dynamic)
 
     def compiled_fn_wrapper(*args, **kwargs):
@@ -155,11 +169,13 @@ class InferencePipelinePointMap(InferencePipeline):
                         ss_input_dict, inference_steps=None
                     )
 
-                    _ = self.run_layout_model(
-                        ss_input_dict,
-                        ss_return_dict,
-                        inference_steps=None,
-                    )
+                    has_layout_model = "layout_model" in self.models
+                    if has_layout_model and self.models["layout_model"] is not None and hasattr(self, "run_layout_model"):
+                        _ = self.run_layout_model(
+                            ss_input_dict,
+                            ss_return_dict,
+                            inference_steps=None,
+                        )
 
     def _preprocess_image_and_mask_pointmap(
         self, rgb_image, mask_image, pointmap, img_mask_pointmap_joint_transform
@@ -384,7 +400,7 @@ class InferencePipelinePointMap(InferencePipeline):
 
     def run(
         self,
-        image: Union[None, Image.Image, np.ndarray],
+        images: Union[None, Image.Image, np.ndarray],
         mask: Union[None, Image.Image, np.ndarray] = None,
         seed: Optional[int] = None,
         stage1_only=False,
@@ -396,25 +412,58 @@ class InferencePipelinePointMap(InferencePipeline):
         stage2_inference_steps=None,
         use_stage1_distillation=False,
         use_stage2_distillation=False,
-        pointmap=None,
+        pointmaps=None,
         decode_formats=None,
         estimate_plane=False,
     ) -> dict:
-        image = self.merge_image_and_mask(image, mask)
-        with self.device: 
-            pointmap_dict = self.compute_pointmap(image, pointmap)
-            pointmap = pointmap_dict["pointmap"]
-            pts = type(self)._down_sample_img(pointmap)
-            pts_colors = type(self)._down_sample_img(pointmap_dict["pts_color"])
+        # image = self.merge_image_and_mask(image, mask)
+        with self.device:
+            # This is not batched because it's jagged.
+            if pointmaps is None:
+                pointmaps = [None] * len(images)
+            else:
+                pointmaps = [torch.tensor(p, dtype=torch.float32) for p in pointmaps]
+            pointmap_dicts = [
+                self.compute_pointmap(image, pointmap)
+                for image, pointmap in zip(images, pointmaps)
+            ]
+            pointmap_list = [pointmap_dict["pointmap"] for pointmap_dict in pointmap_dicts]
+            pts = [
+                type(self)._down_sample_img(pointmap).cpu().permute((1, 2, 0))
+                for pointmap in pointmap_list
+            ]
+            pts_colors = [
+                type(self)._down_sample_img(pointmap_dict["pts_color"])
+                .cpu()
+                .permute((1, 2, 0))
+                for pointmap_dict in pointmap_dicts
+            ]
 
-            if estimate_plane:
-                return self.estimate_plane(pointmap_dict, image)
-
-            ss_input_dict = self.preprocess_image(
-                image, self.ss_preprocessor, pointmap=pointmap
+            # if estimate_plane:
+            #     return self.estimate_plane(pointmap_dict, image)
+            ss_input_dict = batchify(
+                [
+                    self.preprocess_image(image, self.ss_preprocessor, pointmap=pointmap)
+                    for image, pointmap in zip(images, pointmap_list)
+                ]
             )
 
-            slat_input_dict = self.preprocess_image(image, self.slat_preprocessor)
+            has_layout_model = "layout_model" in self.models
+            if has_layout_model and self.models["layout_model"] is not None and hasattr(self, "layout_preprocessor"):
+                layout_input_dict = batchify(
+                    [
+                        self.preprocess_image(
+                            image, self.layout_preprocessor, pointmap=pointmap
+                        )
+                        for image, pointmap in zip(images, pointmap_list)
+                    ]
+                )
+            else:
+                layout_input_dict = {}
+
+            slat_input_dict = batchify(
+                [self.preprocess_image(image, self.slat_preprocessor) for image in images]
+            )
             if seed is not None:
                 torch.manual_seed(seed)
             ss_return_dict = self.sample_sparse_structure(
@@ -437,13 +486,22 @@ class InferencePipelinePointMap(InferencePipeline):
             logger.info(f"Rescaling scale by {ss_return_dict['downsample_factor']} after downsampling")
             ss_return_dict["scale"] = ss_return_dict["scale"] * ss_return_dict["downsample_factor"]
 
+            # Preserve pose/layout prior to any postprocessing for downstream serialization.
+            pre_postprocess_pose = {
+                "rotation": ss_return_dict["rotation"].clone(),
+                "translation": ss_return_dict["translation"].clone(),
+                "scale": ss_return_dict["scale"].clone(),
+            }
+
             if stage1_only:
                 logger.info("Finished!")
                 ss_return_dict["voxel"] = ss_return_dict["coords"][:, 1:] / 64 - 0.5
                 return {
                     **ss_return_dict,
-                    "pointmap": pts.cpu().permute((1, 2, 0)),  # HxWx3
-                    "pointmap_colors": pts_colors.cpu().permute((1, 2, 0)),  # HxWx3
+                    "pointmap": [
+                        pointmap.permute((1, 2, 0)) for pointmap in pointmap_list
+                    ],  # HxWx3
+                    # "pointmap_colors": pts_colors.cpu().permute((1, 2, 0)),  # HxWx3
                 }
                 # return ss_return_dict
 
@@ -454,6 +512,8 @@ class InferencePipelinePointMap(InferencePipeline):
                 inference_steps=stage2_inference_steps,
                 use_distillation=use_stage2_distillation,
             )
+            # Here just decode the first slat
+            slat = slat[0]
             outputs = self.decode_slat(
                 slat, self.decode_formats if decode_formats is None else decode_formats
             )
@@ -472,7 +532,7 @@ class InferencePipelinePointMap(InferencePipeline):
                         logger.info("Running GS layout post optimization method...")
                         postprocessed_pose = self.run_post_optimization_GS(
                             deepcopy(gs_input[0]),
-                            pointmap_dict["intrinsics"],
+                            pointmap_dicts[0]["intrinsics"],
                             ss_return_dict,
                             ss_input_dict,
                             backend="gsplat",
@@ -486,7 +546,7 @@ class InferencePipelinePointMap(InferencePipeline):
                         logger.info("Running mesh layout post optimization method...")
                         postprocessed_pose = self.run_post_optimization(
                             deepcopy(glb),
-                            pointmap_dict["intrinsics"],
+                            pointmap_dicts[0]["intrinsics"],
                             ss_return_dict,
                             ss_input_dict,
                         )
@@ -504,8 +564,9 @@ class InferencePipelinePointMap(InferencePipeline):
             return {
                 **ss_return_dict,
                 **outputs,
-                "pointmap": pts.cpu().permute((1, 2, 0)),  # HxWx3
-                "pointmap_colors": pts_colors.cpu().permute((1, 2, 0)),  # HxWx3
+                "pre_postprocess_pose": pre_postprocess_pose,
+                "pointmap": pts,  # HxWx3
+                "pointmap_colors": pts_colors,  # HxWx3
             }
 
     @staticmethod

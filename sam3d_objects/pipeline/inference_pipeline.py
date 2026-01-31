@@ -93,6 +93,7 @@ class InferencePipeline:
         compile_model=False,
         slat_mean=SLAT_MEAN,
         slat_std=SLAT_STD,
+        multi_conditioning_mode=None,
     ):
         self.rendering_engine = rendering_engine
         self.device = torch.device(device)
@@ -175,6 +176,7 @@ class InferencePipeline:
                 rescale_t=ss_rescale_t,
                 cfg_interval=ss_cfg_interval,
                 cfg_strength_pm=ss_cfg_strength_pm,
+                multi_conditioning_mode=multi_conditioning_mode,
             )
             self.override_slat_generator_cfg_config(
                 slat_generator,
@@ -182,6 +184,7 @@ class InferencePipeline:
                 inference_steps=slat_inference_steps,
                 rescale_t=slat_rescale_t,
                 cfg_interval=slat_cfg_interval,
+                multi_conditioning_mode=multi_conditioning_mode,
             )
 
             self.models = torch.nn.ModuleDict(
@@ -425,6 +428,7 @@ class InferencePipeline:
         rescale_t=3,
         cfg_interval=[0, 500],
         cfg_strength_pm=0.0,
+        multi_conditioning_mode=None,
     ):
         # override generator setting
         ss_generator.inference_steps = inference_steps
@@ -434,6 +438,7 @@ class InferencePipeline:
         ss_generator.reverse_fn.backbone.condition_embedder.normalize_images = True
         ss_generator.reverse_fn.unconditional_handling = "add_flag"
         ss_generator.reverse_fn.strength_pm = cfg_strength_pm
+        ss_generator._solver.multi_conditioning_mode = multi_conditioning_mode
 
         logger.info(
             "ss_generator parameters: inference_steps={}, cfg_strength={}, cfg_interval={}, rescale_t={}, cfg_strength_pm={}",
@@ -451,11 +456,13 @@ class InferencePipeline:
         inference_steps=25,
         rescale_t=3,
         cfg_interval=[0, 500],
+        multi_conditioning_mode=None,
     ):
         slat_generator.inference_steps = inference_steps
         slat_generator.reverse_fn.strength = cfg_strength
         slat_generator.reverse_fn.interval = cfg_interval
         slat_generator.rescale_t = rescale_t
+        slat_generator._solver.multi_conditioning_mode = multi_conditioning_mode
 
         logger.info(
             "slat_generator parameters: inference_steps={}, cfg_strength={}, cfg_interval={}, rescale_t={}",
@@ -700,21 +707,36 @@ class InferencePipeline:
                     .contiguous()
                     .view(shape_latent.shape[0], 8, 16, 16, 16)
                 )
-                coords = torch.argwhere(ss > 0)[:, [0, 2, 3, 4]].int()
+                # Do this part batch by batch
+                coords_original_list = []
+                coords_list = []
+                for i in range(bs):
+                    ss_b = ss[i : i + 1]
+                    coords_orig = torch.argwhere(ss_b > 0)[:, [0, 2, 3, 4]].int()
 
-                # downsample output
-                return_dict["coords_original"] = coords
-                original_shape = coords.shape
-                if self.downsample_ss_dist > 0:
-                    coords = prune_sparse_structure(
-                        coords,
-                        max_neighbor_axes_dist=self.downsample_ss_dist,
+                    # downsample output
+                    original_shape = coords_orig.shape
+                    coords = torch.clone(coords_orig)
+                    if self.downsample_ss_dist > 0:
+                        coords = prune_sparse_structure(
+                            coords,
+                            max_neighbor_axes_dist=self.downsample_ss_dist,
+                        )
+                    coords, downsample_factor = downsample_sparse_structure(coords)
+                    logger.info(
+                        f"Downsampled coords from {original_shape[0]} to {coords.shape[0]}"
                     )
-                coords, downsample_factor = downsample_sparse_structure(coords)
-                logger.info(
-                    f"Downsampled coords from {original_shape[0]} to {coords.shape[0]}"
-                )
-                return_dict["coords"] = coords
+
+                    # Put the actual batch indices in
+                    coords_orig[:, 0] = i
+                    coords[:, 0] = i
+
+                    # Record
+                    coords_original_list.append(coords_orig)
+                    coords_list.append(coords)
+
+                return_dict["coords_original"] = torch.cat(coords_original_list, dim=0)
+                return_dict["coords"] = torch.cat(coords_list, dim=0)
                 return_dict["downsample_factor"] = downsample_factor
 
         ss_generator.inference_steps = prev_inference_steps

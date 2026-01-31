@@ -2,6 +2,7 @@
 import optree
 import torch
 from functools import partial
+from typing import Optional, Literal
 
 from sam3d_objects.data.utils import tree_tensor_map
 
@@ -27,14 +28,48 @@ def gradient(output, x, create_graph: bool = False):
 
 
 class ODESolver:
+    def __init__(
+        self, multi_conditioning_mode: Optional[Literal["round_robin", "average"]] = None
+    ):
+        self.multi_conditioning_mode = multi_conditioning_mode
+
     def step(self, dynamics_fn, x_t, t, dt, *args, **kwargs):
         raise NotImplementedError
 
     def solve_iter(self, dynamics_fn, x_init, times, *args, **kwargs):
         x_t = x_init
-        for t0, t1 in zip(times[:-1], times[1:]):
+        for i, (t0, t1) in enumerate(zip(times[:-1], times[1:])):
             dt = t1 - t0
+
+            # assert self.multi_conditioning_mode is not None, "multi_conditioning_mode must be set"
+            if self.multi_conditioning_mode == "round_robin":
+                # In round-robin sampling, we want to condition on the time step index modulo the batch size.
+                batch_size = (
+                    x_t["shape"].shape[0] if isinstance(x_t, dict) else x_t.shape[0]
+                )
+
+                # All the conditional args that start with that shape should have their data replaced
+                # with the appropriate index.
+                new_args = []
+                for arg in args:
+                    if isinstance(arg, torch.Tensor) and arg.shape[0] == batch_size:
+                        index = i % batch_size
+                        arg = arg[index : index + 1].expand_as(arg)
+                    new_args.append(arg)
+                args = tuple(new_args)
+
             x_t = self.step(dynamics_fn, x_t, t0, dt, *args, **kwargs)
+
+            if self.multi_conditioning_mode == "average":
+                if isinstance(x_t, dict) and "shape" in x_t:
+                    # If there's a `shape` field in x_t, we replace all of its entries with the average
+                    # along the batch dimension. This serves as a form of multi-image sampling.
+                    shape = x_t["shape"]
+                    x_t["shape"][:] = torch.mean(shape, dim=0, keepdim=True)
+                else:
+                    # Otherwise this is the SLat sampling, in which case x_t is a tensor and we similarly
+                    # replace it with its average along the batch dimension.
+                    x_t[:] = torch.mean(x_t, dim=0, keepdim=True)
             yield x_t, t0
 
     def solve(self, dynamics_fn, x_init, times, *args, **kwargs):
@@ -54,8 +89,8 @@ class Euler(ODESolver):
 # https://arxiv.org/abs/2505.05470
 class SDE(ODESolver):
     def __init__(self, **kwargs):
-        super().__init__()
-        self.sde_strength = kwargs.get("sde_strength", 0.1)
+        self.sde_strength = kwargs.pop("sde_strength", 0.1)
+        super().__init__(**kwargs)
 
     def step(self, dynamics_fn, x_t, t, dt, *args, **kwargs):
         velocity = dynamics_fn(x_t, t, *args, **kwargs)
